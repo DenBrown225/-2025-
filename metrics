@@ -1,0 +1,869 @@
+# complete_evaluation_system.py
+# complete_evaluation_system.py
+import numpy as np
+import pandas as pd
+import math
+import pickle
+import json
+import warnings
+import os
+from typing import List, Dict, Set, Tuple, Any, Optional
+from datetime import datetime
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix, classification_report
+warnings.filterwarnings('ignore')
+
+class RecommendationSystemEvaluator:
+    def __init__(self):
+        self.train_data = None
+        self.test_data = None
+        self.submission_data = None
+        self.relevance_dict = None
+        self.model = None
+        self.model_config = {}
+        self.evaluation_results = {}
+        self.items_df = None
+        self.preprocessed_data = None
+
+    def load_data(self, train_path: str = 'train.csv',
+                  test_path: str = 'test.csv',
+                  submission_path: str = 'submission.csv'):
+        """
+        Загрузка данных для вычисления метрик
+
+        Args:
+            train_path: путь к файлу train.csv
+            test_path: путь к файлу test.csv
+            submission_path: путь к файлу submission.csv
+        """
+        print("📂 ЗАГРУЗКА ДАННЫХ ДЛЯ ВЫЧИСЛЕНИЯ МЕТРИК...")
+
+        try:
+            # Загружаем train данные для получения ground truth
+            self.train_data = pd.read_csv(train_path)
+            print(f"📊 Загружено {len(self.train_data)} обучающих пар из {train_path}")
+
+            # Загружаем test данные
+            self.test_data = pd.read_csv(test_path)
+            print(f"🧪 Загружено {len(self.test_data)} тестовых запросов из {test_path}")
+
+            # Загружаем submission (результаты модели)
+            self.submission_data = pd.read_csv(submission_path)
+            print(f"📈 Загружено {len(self.submission_data)} рекомендаций из {submission_path}")
+
+            # Проверяем соответствие размеров
+            if len(self.test_data) != len(self.submission_data):
+                print(f"⚠️  Внимание: test.csv содержит {len(self.test_data)} записей, "
+                      f"а submission.csv содержит {len(self.submission_data)} записей")
+
+            return True
+
+        except FileNotFoundError as e:
+            print(f"❌ Ошибка загрузки файлов: {e}")
+            print("⚠️  Убедитесь, что файлы существуют:")
+            print(f"   - {train_path}")
+            print(f"   - {test_path}")
+            print(f"   - {submission_path}")
+            return False
+        except Exception as e:
+            print(f"❌ Неожиданная ошибка при загрузке данных: {e}")
+            return False
+
+    def save_model(self, model: Any, model_name: str = 'recommendation_model',
+                   config: Dict = None, output_dir: str = 'saved_models'):
+        """
+        Сохранение модели в файл для дальнейшего использования
+
+        Args:
+            model: объект модели для сохранения
+            model_name: имя модели
+            config: конфигурация модели
+            output_dir: директория для сохранения
+        """
+        print(f"\n💾 СОХРАНЕНИЕ МОДЕЛИ '{model_name}'...")
+
+        try:
+            # Создаем директорию если не существует
+            os.makedirs(output_dir, exist_ok=True)
+
+            # Формируем имя файла с временной меткой
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            model_filename = f"{model_name}_{timestamp}.pkl"
+            config_filename = f"{model_name}_config_{timestamp}.json"
+
+            model_path = os.path.join(output_dir, model_filename)
+            config_path = os.path.join(output_dir, config_filename)
+
+            # Сохраняем модель
+            with open(model_path, 'wb') as f:
+                pickle.dump(model, f)
+            print(f"✅ Модель сохранена в: {model_path}")
+
+            # Сохраняем конфигурацию
+            if config:
+                config['saved_timestamp'] = timestamp
+                config['model_filename'] = model_filename
+                with open(config_path, 'w') as f:
+                    json.dump(config, f, indent=2)
+                print(f"✅ Конфигурация сохранена в: {config_path}")
+
+            # Сохраняем информацию о модели в классе
+            self.model = model
+            self.model_config = config if config else {}
+            self.model_config['save_path'] = model_path
+
+            return model_path
+
+        except Exception as e:
+            print(f"❌ Ошибка сохранения модели: {e}")
+            return None
+
+    def load_model(self, model_path: str, config_path: Optional[str] = None):
+        """
+        Загрузка модели из файла
+
+        Args:
+            model_path: путь к файлу модели
+            config_path: путь к файлу конфигурации (опционально)
+        """
+        print(f"\n🤖 ЗАГРУЗКА МОДЕЛИ ИЗ ФАЙЛА...")
+
+        try:
+            # Загружаем модель
+            with open(model_path, 'rb') as f:
+                self.model = pickle.load(f)
+            print(f"✅ Модель загружена из: {model_path}")
+            print(f"   Тип модели: {type(self.model).__name__}")
+
+            # Загружаем конфигурацию если указана
+            if config_path and os.path.exists(config_path):
+                with open(config_path, 'r') as f:
+                    self.model_config = json.load(f)
+                print(f"✅ Конфигурация загружена из: {config_path}")
+            else:
+                # Пытаемся найти конфигурацию автоматически
+                base_name = os.path.splitext(model_path)[0]
+                config_candidates = [
+                    config_path,
+                    base_name + '_config.json',
+                    base_name.replace('_model_', '_config_') + '.json'
+                ]
+
+                for candidate in config_candidates:
+                    if candidate and os.path.exists(candidate):
+                        with open(candidate, 'r') as f:
+                            self.model_config = json.load(f)
+                        print(f"✅ Конфигурация загружена из: {candidate}")
+                        break
+                else:
+                    print("⚠️  Конфигурация модели не найдена")
+                    self.model_config = {'model_path': model_path}
+
+            return True
+
+        except FileNotFoundError:
+            print(f"❌ Файл модели не найден: {model_path}")
+            return False
+        except Exception as e:
+            print(f"❌ Ошибка загрузки модели: {e}")
+            return False
+
+    def load_preprocessed_data(self, preprocessed_path: str = 'preprocessed_data.pkl'):
+        """
+        Загрузка предобработанных данных
+
+        Args:
+            preprocessed_path: путь к предобработанным данным
+        """
+        print("\n📊 ЗАГРУЗКА ПРЕДОБРАБОТАННЫХ ДАННЫХ...")
+
+        try:
+            with open(preprocessed_path, 'rb') as f:
+                self.preprocessed_data = pickle.load(f)
+                print(f"✅ Загружены предобработанные данные из {preprocessed_path}")
+
+                # Извлекаем основные данные
+                if 'items_df' in self.preprocessed_data:
+                    self.items_df = self.preprocessed_data['items_df']
+                    print(f"   - Загружено {len(self.items_df)} объектов")
+
+                if 'relevance_pairs' in self.preprocessed_data:
+                    self.relevance_pairs = self.preprocessed_data['relevance_pairs']
+                    print(f"   - Загружено {len(self.relevance_pairs)} пар релевантности")
+
+                if 'item_popularity' in self.preprocessed_data:
+                    self.item_popularity = self.preprocessed_data['item_popularity']
+                    print(f"   - Загружено {len(self.item_popularity)} элементов популярности")
+
+            return True
+
+        except FileNotFoundError:
+            print(f"⚠️  Файл предобработанных данных не найден: {preprocessed_path}")
+            return False
+        except Exception as e:
+            print(f"❌ Ошибка загрузки предобработанных данных: {e}")
+            return False
+
+    def create_relevance_dict(self) -> Dict[str, Set[str]]:
+        """
+        Создает словарь релевантности из train данных
+
+        Returns:
+            Словарь {query_id: set(relevant_item_ids)}
+        """
+        print("\n🔍 СОЗДАНИЕ СЛОВАРЯ РЕЛЕВАНТНОСТИ...")
+
+        if self.train_data is None:
+            raise ValueError("Train данные не загружены")
+
+        self.relevance_dict = {}
+
+        for _, row in self.train_data.iterrows():
+            query_id = str(row['query_id'])
+            item_id = str(row['item_id'])
+
+            if query_id not in self.relevance_dict:
+                self.relevance_dict[query_id] = set()
+            self.relevance_dict[query_id].add(item_id)
+
+        print(f"✅ Создано {len(self.relevance_dict)} уникальных запросов с релевантными объектами")
+
+        # Статистика
+        rel_counts = [len(items) for items in self.relevance_dict.values()]
+        print(f"📊 Среднее количество релевантных объектов на запрос: {np.mean(rel_counts):.2f}")
+        print(f"📈 Максимальное количество релевантных объектов: {max(rel_counts)}")
+        print(f"📉 Минимальное количество релевантных объектов: {min(rel_counts)}")
+
+        return self.relevance_dict
+
+    def calculate_all_metrics(self, k_values: List[int] = [1, 3, 5, 10]) -> Dict[str, Any]:
+        """
+        Вычисление всех метрик качества
+
+        Args:
+            k_values: список значений k для вычисления метрик
+
+        Returns:
+            Словарь со всеми вычисленными метриками
+        """
+        print("\n📈 ВЫЧИСЛЕНИЕ ВСЕХ МЕТРИК КАЧЕСТВА...")
+
+        if self.relevance_dict is None:
+            self.create_relevance_dict()
+
+        metrics = {
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'total_test_queries': len(self.test_data),
+            'total_train_pairs': len(self.train_data),
+            'k_values': k_values
+        }
+
+        # Инициализация структур для метрик
+        accuracy_results = {k: {'correct': 0, 'total': 0} for k in k_values}
+        precision_results = {k: [] for k in k_values}
+        recall_results = {k: [] for k in k_values}
+        ndcg_results = {k: [] for k in k_values}
+        map_results = {k: [] for k in k_values}
+        query_details = []
+
+        processed_queries = 0
+
+        for idx, test_row in self.test_data.iterrows():
+            query_id = str(test_row['id'])
+
+            # Пропускаем если нет рекомендаций или релевантных объектов
+            if idx >= len(self.submission_data) or query_id not in self.relevance_dict:
+                continue
+
+            # Получаем рекомендации
+            rec_items = self.submission_data.iloc[idx]['relevant_item_id_list']
+            if isinstance(rec_items, str):
+                recommended = rec_items.split()
+            else:
+                recommended = []
+
+            # Получаем релевантные объекты
+            relevant = self.relevance_dict[query_id]
+
+            query_metrics = {
+                'query_id': query_id,
+                'num_relevant': len(relevant),
+                'num_recommended': len(recommended)
+            }
+
+            # Вычисляем метрики для каждого k
+            for k in k_values:
+                # Берем топ-k рекомендаций
+                top_k = recommended[:k]
+
+                # Accuracy@k
+                found_relevant = any(item in relevant for item in top_k)
+                accuracy_results[k]['correct'] += 1 if found_relevant else 0
+                accuracy_results[k]['total'] += 1
+
+                # Precision@k и Recall@k
+                tp = sum(1 for item in top_k if item in relevant)
+                precision = tp / len(top_k) if len(top_k) > 0 else 0
+                recall = tp / len(relevant) if len(relevant) > 0 else 0
+
+                precision_results[k].append(precision)
+                recall_results[k].append(recall)
+
+                # nDCG@k
+                rel_scores = [1 if item in relevant else 0 for item in top_k]
+                while len(rel_scores) < k:
+                    rel_scores.append(0)
+
+                dcg = sum(score / math.log2(i + 2) for i, score in enumerate(rel_scores[:k]))
+
+                num_relevant_k = min(len(relevant), k)
+                ideal_scores = [1] * num_relevant_k + [0] * (k - num_relevant_k)
+                idcg = sum(score / math.log2(i + 2) for i, score in enumerate(ideal_scores))
+
+                ndcg = dcg / idcg if idcg > 0 else 0
+                ndcg_results[k].append(ndcg)
+
+                # AP@k для MAP
+                running_sum = 0
+                num_relevant_found = 0
+
+                for i, item in enumerate(top_k):
+                    if item in relevant:
+                        num_relevant_found += 1
+                        precision_at_i = num_relevant_found / (i + 1)
+                        running_sum += precision_at_i
+
+                ap = running_sum / len(relevant) if len(relevant) > 0 else 0
+                map_results[k].append(ap)
+
+                # Сохраняем метрики для этого запроса
+                query_metrics[f'accuracy@{k}'] = 1 if found_relevant else 0
+                query_metrics[f'precision@{k}'] = precision
+                query_metrics[f'recall@{k}'] = recall
+                query_metrics[f'ndcg@{k}'] = ndcg
+                query_metrics[f'ap@{k}'] = ap
+                query_metrics[f'found@{k}'] = tp
+
+            query_details.append(query_metrics)
+            processed_queries += 1
+
+            # Прогресс
+            if processed_queries % 100 == 0:
+                print(f"   Обработано {processed_queries} запросов...")
+
+        # Вычисляем средние значения
+        final_metrics = {}
+
+        for k in k_values:
+            # Accuracy@k
+            if accuracy_results[k]['total'] > 0:
+                accuracy = accuracy_results[k]['correct'] / accuracy_results[k]['total']
+            else:
+                accuracy = 0
+
+            # Precision@k
+            precision_avg = np.mean(precision_results[k]) if precision_results[k] else 0
+
+            # Recall@k
+            recall_avg = np.mean(recall_results[k]) if recall_results[k] else 0
+
+            # nDCG@k
+            ndcg_avg = np.mean(ndcg_results[k]) if ndcg_results[k] else 0
+
+            # MAP@k
+            map_avg = np.mean(map_results[k]) if map_results[k] else 0
+
+            # F1-Score@k
+            f1 = 2 * precision_avg * recall_avg / (precision_avg + recall_avg + 1e-8)
+
+            final_metrics[f'accuracy@{k}'] = accuracy
+            final_metrics[f'precision@{k}'] = precision_avg
+            final_metrics[f'recall@{k}'] = recall_avg
+            final_metrics[f'f1@{k}'] = f1
+            final_metrics[f'ndcg@{k}'] = ndcg_avg
+            final_metrics[f'map@{k}'] = map_avg
+
+        # Дополнительная статистика
+        coverage_stats = self._calculate_coverage_statistics()
+
+        # Сохраняем все результаты
+        self.evaluation_results = {
+            'metrics': final_metrics,
+            'query_details': query_details,
+            'coverage_stats': coverage_stats,
+            'processed_queries': processed_queries,
+            'accuracy_raw': accuracy_results,
+            'precision_raw': precision_results,
+            'recall_raw': recall_results,
+            'ndcg_raw': ndcg_results,
+            'map_raw': map_results
+        }
+
+        # Выводим основные результаты
+        self._print_metrics_summary(k_values)
+
+        return self.evaluation_results
+
+    def _calculate_coverage_statistics(self) -> Dict[str, Any]:
+        """
+        Вычисление статистики покрытия
+        """
+        print("\n📊 ВЫЧИСЛЕНИЕ СТАТИСТИКИ ПОКРЫТИЯ...")
+
+        # Уникальные объекты в рекомендациях
+        all_recommended_items = set()
+        recommendation_counts = []
+
+        for idx, row in self.submission_data.iterrows():
+            rec_items = row['relevant_item_id_list']
+            if isinstance(rec_items, str):
+                items = rec_items.split()
+                all_recommended_items.update(items)
+                recommendation_counts.append(len(items))
+
+        # Уникальные объекты в train
+        all_train_items = set()
+        if self.relevance_dict:
+            for items in self.relevance_dict.values():
+                all_train_items.update(items)
+
+        # Вычисляем метрики покрытия
+        coverage_stats = {
+            'unique_items_in_train': len(all_train_items),
+            'unique_items_recommended': len(all_recommended_items),
+            'item_coverage': len(all_recommended_items) / len(all_train_items) if len(all_train_items) > 0 else 0,
+            'avg_recommendations_per_query': np.mean(recommendation_counts) if recommendation_counts else 0,
+            'std_recommendations_per_query': np.std(recommendation_counts) if recommendation_counts else 0,
+            'max_recommendations_per_query': max(recommendation_counts) if recommendation_counts else 0,
+            'min_recommendations_per_query': min(recommendation_counts) if recommendation_counts else 0,
+            'median_recommendations_per_query': np.median(recommendation_counts) if recommendation_counts else 0,
+            'recommendation_distribution': pd.Series(recommendation_counts).value_counts().to_dict()
+        }
+
+        print(f"   Уникальных объектов в train: {coverage_stats['unique_items_in_train']}")
+        print(f"   Уникальных объектов в рекомендациях: {coverage_stats['unique_items_recommended']}")
+        print(f"   Покрытие объектов: {coverage_stats['item_coverage']:.2%}")
+        print(f"   Среднее количество рекомендаций: {coverage_stats['avg_recommendations_per_query']:.2f}")
+
+        return coverage_stats
+
+    def _print_metrics_summary(self, k_values: List[int]):
+        """
+        Вывод сводки метрик
+        """
+        print("\n" + "="*60)
+        print("📊 СВОДКА МЕТРИК КАЧЕСТВА")
+        print("="*60)
+
+        metrics = self.evaluation_results['metrics']
+
+        for k in k_values:
+            print(f"\n📍 k = {k}:")
+            print(f"   Accuracy@{k}:   {metrics.get(f'accuracy@{k}', 0):.4f}")
+            print(f"   Precision@{k}:  {metrics.get(f'precision@{k}', 0):.4f}")
+            print(f"   Recall@{k}:     {metrics.get(f'recall@{k}', 0):.4f}")
+            print(f"   F1-Score@{k}:   {metrics.get(f'f1@{k}', 0):.4f}")
+            print(f"   nDCG@{k}:       {metrics.get(f'ndcg@{k}', 0):.4f}")
+            print(f"   MAP@{k}:        {metrics.get(f'map@{k}', 0):.4f}")
+
+        print(f"\n📈 Обработано запросов: {self.evaluation_results['processed_queries']}")
+        print(f"📊 Покрытие объектов: {self.evaluation_results['coverage_stats']['item_coverage']:.2%}")
+
+    def save_evaluation_results(self, output_dir: str = 'evaluation_results',
+                               model_name: str = 'model'):
+        """
+        Сохранение результатов оценки
+
+        Args:
+            output_dir: директория для сохранения
+            model_name: имя модели
+        """
+        print(f"\n💾 СОХРАНЕНИЕ РЕЗУЛЬТАТОВ ОЦЕНКИ...")
+
+        try:
+            # Создаем директорию если не существует
+            os.makedirs(output_dir, exist_ok=True)
+
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+            # 1. Сохраняем основные метрики в JSON
+            metrics_file = os.path.join(output_dir, f'{model_name}_metrics_{timestamp}.json')
+
+            # Подготовка данных для сохранения
+            save_data = {
+                'model_info': {
+                    'name': model_name,
+                    'evaluation_timestamp': self.evaluation_results.get('timestamp', ''),
+                    'model_config': self.model_config
+                },
+                'dataset_info': {
+                    'train_size': len(self.train_data) if self.train_data is not None else 0,
+                    'test_size': len(self.test_data) if self.test_data is not None else 0,
+                    'processed_queries': self.evaluation_results.get('processed_queries', 0)
+                },
+                'metrics': self.evaluation_results.get('metrics', {}),
+                'coverage_stats': self.evaluation_results.get('coverage_stats', {})
+            }
+
+            with open(metrics_file, 'w') as f:
+                json.dump(save_data, f, indent=2, default=str)
+            print(f"✅ Метрики сохранены в: {metrics_file}")
+
+            # 2. Сохраняем детали по запросам в CSV
+            if 'query_details' in self.evaluation_results:
+                details_file = os.path.join(output_dir, f'{model_name}_query_details_{timestamp}.csv')
+                details_df = pd.DataFrame(self.evaluation_results['query_details'])
+                details_df.to_csv(details_file, index=False)
+                print(f"✅ Детали по запросам сохранены в: {details_file}")
+
+            # 3. Сохраняем сводный отчет в TXT
+            report_file = os.path.join(output_dir, f'{model_name}_report_{timestamp}.txt')
+            self._generate_text_report(report_file, save_data)
+            print(f"✅ Текстовый отчет сохранен в: {report_file}")
+
+            # 4. Сохраняем визуализации (опционально)
+            try:
+                self._generate_visualizations(output_dir, model_name, timestamp)
+            except Exception as e:
+                print(f"⚠️  Не удалось создать визуализации: {e}")
+
+            # 5. Сохраняем конфигурацию запуска
+            config_file = os.path.join(output_dir, f'{model_name}_evaluation_config_{timestamp}.json')
+            run_config = {
+                'evaluation_date': timestamp,
+                'model_name': model_name,
+                'train_file': 'train.csv',
+                'test_file': 'test.csv',
+                'submission_file': 'submission.csv',
+                'k_values': list(self.evaluation_results.get('metrics', {}).keys())
+            }
+
+            with open(config_file, 'w') as f:
+                json.dump(run_config, f, indent=2)
+
+            print(f"\n🎉 Все результаты сохранены в директории: {output_dir}/")
+
+            return {
+                'metrics_file': metrics_file,
+                'report_file': report_file
+            }
+
+        except Exception as e:
+            print(f"❌ Ошибка сохранения результатов: {e}")
+            return None
+
+    def _generate_text_report(self, filepath: str, data: Dict):
+        """
+        Генерация текстового отчета
+        """
+        with open(filepath, 'w') as f:
+            f.write("="*70 + "\n")
+            f.write("ОТЧЕТ ПО ОЦЕНКЕ РЕКОМЕНДАТЕЛЬНОЙ СИСТЕМЫ\n")
+            f.write("="*70 + "\n\n")
+
+            # Информация о модели
+            f.write("ИНФОРМАЦИЯ О МОДЕЛИ:\n")
+            f.write("-"*40 + "\n")
+            f.write(f"Название модели: {data['model_info']['name']}\n")
+            f.write(f"Дата оценки: {data['model_info']['evaluation_timestamp']}\n\n")
+
+            # Информация о данных
+            f.write("ИНФОРМАЦИЯ О ДАННЫХ:\n")
+            f.write("-"*40 + "\n")
+            f.write(f"Размер обучающей выборки: {data['dataset_info']['train_size']}\n")
+            f.write(f"Размер тестовой выборки: {data['dataset_info']['test_size']}\n")
+            f.write(f"Обработано запросов: {data['dataset_info']['processed_queries']}\n\n")
+
+            # Метрики
+            f.write("МЕТРИКИ КАЧЕСТВА:\n")
+            f.write("-"*40 + "\n")
+
+            metrics = data['metrics']
+            for metric_name, value in metrics.items():
+                f.write(f"{metric_name:20}: {value:.4f}\n")
+
+            f.write("\n")
+
+            # Статистика покрытия
+            f.write("СТАТИСТИКА ПОКРЫТИЯ:\n")
+            f.write("-"*40 + "\n")
+            coverage = data['coverage_stats']
+            f.write(f"Уникальных объектов в train: {coverage['unique_items_in_train']}\n")
+            f.write(f"Уникальных объектов в рекомендациях: {coverage['unique_items_recommended']}\n")
+            f.write(f"Покрытие объектов: {coverage['item_coverage']:.2%}\n")
+            f.write(f"Среднее количество рекомендаций на запрос: {coverage['avg_recommendations_per_query']:.2f}\n")
+            f.write(f"Стандартное отклонение рекомендаций: {coverage['std_recommendations_per_query']:.2f}\n")
+
+            f.write("\n" + "="*70 + "\n")
+            f.write("КОНЕЦ ОТЧЕТА\n")
+            f.write("="*70 + "\n")
+
+    def _generate_visualizations(self, output_dir: str, model_name: str, timestamp: str):
+        """
+        Генерация визуализаций метрик
+        """
+        if not self.evaluation_results:
+            return
+
+        # Создаем директорию для графиков
+        plots_dir = os.path.join(output_dir, 'plots')
+        os.makedirs(plots_dir, exist_ok=True)
+
+        metrics = self.evaluation_results['metrics']
+
+        # Извлекаем значения k из названий метрик
+        k_values = sorted(set(int(k.split('@')[1]) for k in metrics.keys() if '@' in k))
+
+        if not k_values:
+            return
+
+        # 1. График метрик по разным k
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        axes = axes.flatten()
+
+        metric_types = ['accuracy', 'precision', 'recall', 'f1', 'ndcg', 'map']
+
+        for idx, metric_type in enumerate(metric_types):
+            ax = axes[idx]
+            values = []
+            ks = []
+
+            for k in k_values:
+                metric_key = f'{metric_type}@{k}'
+                if metric_key in metrics:
+                    values.append(metrics[metric_key])
+                    ks.append(k)
+
+            if values:
+                ax.plot(ks, values, marker='o', linewidth=2, markersize=8)
+                ax.set_title(f'{metric_type.upper()} по разным k', fontsize=12, fontweight='bold')
+                ax.set_xlabel('k')
+                ax.set_ylabel(metric_type)
+                ax.grid(True, alpha=0.3)
+                ax.set_ylim(0, 1.05)
+
+                # Добавляем значения на точках
+                for x, y in zip(ks, values):
+                    ax.text(x, y + 0.02, f'{y:.3f}', ha='center', fontsize=9)
+
+        plt.tight_layout()
+        plot_path = os.path.join(plots_dir, f'{model_name}_metrics_by_k_{timestamp}.png')
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+        # 2. Распределение nDCG@10
+        if 'ndcg_raw' in self.evaluation_results and 10 in self.evaluation_results['ndcg_raw']:
+            ndcg_values = self.evaluation_results['ndcg_raw'][10]
+
+            plt.figure(figsize=(10, 6))
+            plt.hist(ndcg_values, bins=20, alpha=0.7, color='skyblue', edgecolor='black')
+            plt.title('Распределение nDCG@10 по запросам', fontsize=14, fontweight='bold')
+            plt.xlabel('nDCG@10')
+            plt.ylabel('Количество запросов')
+            plt.grid(True, alpha=0.3)
+
+            # Добавляем статистику
+            mean_val = np.mean(ndcg_values)
+            median_val = np.median(ndcg_values)
+            plt.axvline(mean_val, color='red', linestyle='--', linewidth=2, label=f'Среднее: {mean_val:.3f}')
+            plt.axvline(median_val, color='green', linestyle='--', linewidth=2, label=f'Медиана: {median_val:.3f}')
+            plt.legend()
+
+            plot_path2 = os.path.join(plots_dir, f'{model_name}_ndcg_distribution_{timestamp}.png')
+            plt.savefig(plot_path2, dpi=150, bbox_inches='tight')
+            plt.close()
+
+        print(f"✅ Визуализации сохранены в: {plots_dir}/")
+
+    def create_model_card(self, model_info: Dict = None, output_dir: str = 'model_cards'):
+        """
+        Создание карточки модели (Model Card)
+
+        Args:
+            model_info: дополнительная информация о модели
+            output_dir: директория для сохранения
+        """
+        print(f"\n📋 СОЗДАНИЕ КАРТОЧКИ МОДЕЛИ...")
+
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            model_card_path = os.path.join(output_dir, f'model_card_{timestamp}.md')
+
+            with open(model_card_path, 'w') as f:
+                f.write("# Карточка модели (Model Card)\n\n")
+
+                # Метаинформация
+                f.write("## Метаинформация\n")
+                f.write(f"- **Дата создания:** {timestamp}\n")
+                f.write(f"- **Тип модели:** Рекомендательная система\n")
+                f.write(f"- **Задача:** Поиск релевантных музейных объектов\n\n")
+
+                # Информация о данных
+                f.write("## Данные\n")
+                f.write(f"- **Обучающая выборка:** {len(self.train_data)} пар\n")
+                f.write(f"- **Тестовая выборка:** {len(self.test_data)} запросов\n")
+                f.write(f"- **Размер словаря объектов:** {len(set().union(*self.relevance_dict.values()))}\n\n")
+
+                # Метрики
+                f.write("## Метрики качества\n")
+                f.write("| Метрика | Значение |\n")
+                f.write("|---------|----------|\n")
+
+                metrics = self.evaluation_results.get('metrics', {})
+                for metric_name, value in sorted(metrics.items()):
+                    f.write(f"| {metric_name} | {value:.4f} |\n")
+
+                f.write("\n")
+
+                # Статистика покрытия
+                coverage = self.evaluation_results.get('coverage_stats', {})
+                f.write("## Статистика покрытия\n")
+                f.write(f"- **Покрытие объектов:** {coverage.get('item_coverage', 0):.2%}\n")
+                f.write(f"- **Уникальных объектов рекомендовано:** {coverage.get('unique_items_recommended', 0)}\n")
+                f.write(f"- **Среднее количество рекомендаций:** {coverage.get('avg_recommendations_per_query', 0):.2f}\n\n")
+
+                # Конфигурация модели
+                if self.model_config:
+                    f.write("## Конфигурация модели\n")
+                    f.write("```json\n")
+                    f.write(json.dumps(self.model_config, indent=2, default=str))
+                    f.write("\n```\n\n")
+
+                # Рекомендации по использованию
+                f.write("## Рекомендации по использованию\n")
+                f.write("- Модель предназначена для рекомендации музейных объектов\n")
+                f.write("- Оптимальное количество рекомендаций: 10\n")
+                f.write("- Модель учитывает модальность объектов\n")
+                f.write("- Для улучшения результатов рекомендуется обновлять данные\n")
+
+            print(f"✅ Карточка модели сохранена в: {model_card_path}")
+
+            return model_card_path
+
+        except Exception as e:
+            print(f"❌ Ошибка создания карточки модели: {e}")
+            return None
+
+def main():
+    """
+    Основная функция для полной оценки и сохранения модели
+    """
+    print("🎯 ПОЛНАЯ СИСТЕМА ОЦЕНКИ И СОХРАНЕНИЯ МОДЕЛИ")
+    print("="*70)
+
+    # Конфигурация
+    CONFIG = {
+        'train_path': 'train.csv',
+        'test_path': 'test.csv',
+        'submission_path': 'submission.csv',
+        'model_path': 'model.pkl',  # Для загрузки существующей модели
+        'preprocessed_path': 'preprocessed_data.pkl',
+        'k_values': [1, 3, 5, 10],
+        'model_name': 'museum_recommender',
+        'output_dir': 'evaluation_results'
+    }
+
+    # Инициализация оценщика
+    evaluator = RecommendationSystemEvaluator()
+
+    try:
+        # 1. Загрузка данных
+        print("\n1️⃣  ЗАГРУЗКА ДАННЫХ")
+        if not evaluator.load_data(CONFIG['train_path'], CONFIG['test_path'], CONFIG['submission_path']):
+            return
+
+        # 2. Загрузка модели (если есть)
+        print("\n2️⃣  ЗАГРУЗКА МОДЕЛИ")
+        if os.path.exists(CONFIG['model_path']):
+            evaluator.load_model(CONFIG['model_path'])
+        else:
+            print("⚠️  Файл модели не найден. Продолжаем без загрузки модели.")
+
+        # 3. Загрузка предобработанных данных (если есть)
+        print("\n3️⃣  ЗАГРУЗКА ПРЕДОБРАБОТАННЫХ ДАННЫХ")
+        if os.path.exists(CONFIG['preprocessed_path']):
+            evaluator.load_preprocessed_data(CONFIG['preprocessed_path'])
+        else:
+            print("⚠️  Файл предобработанных данных не найден.")
+
+        # 4. Вычисление метрик
+        print("\n4️⃣  ВЫЧИСЛЕНИЕ МЕТРИК")
+        results = evaluator.calculate_all_metrics(k_values=CONFIG['k_values'])
+
+        # 5. Пример создания и сохранения модели
+        print("\n5️⃣  СОХРАНЕНИЕ МОДЕЛИ")
+
+        # Создаем пример модели для сохранения
+        example_model = {
+            'type': 'recommendation_system',
+            'metrics': results['metrics'],
+            'config': {
+                'k_values': CONFIG['k_values'],
+                'model_name': CONFIG['model_name'],
+                'evaluation_date': datetime.now().strftime('%Y-%m-%d')
+            }
+        }
+
+        # Сохраняем модель
+        saved_model_path = evaluator.save_model(
+            model=example_model,
+            model_name=CONFIG['model_name'],
+            config=example_model['config'],
+            output_dir='saved_models'
+        )
+
+        # 6. Сохранение результатов оценки
+        print("\n6️⃣  СОХРАНЕНИЕ РЕЗУЛЬТАТОВ ОЦЕНКИ")
+        saved_results = evaluator.save_evaluation_results(
+            output_dir=CONFIG['output_dir'],
+            model_name=CONFIG['model_name']
+        )
+
+        # 7. Создание карточки модели
+        print("\n7️⃣  СОЗДАНИЕ КАРТОЧКИ МОДЕЛИ")
+        model_card_path = evaluator.create_model_card(
+            model_info={
+                'name': CONFIG['model_name'],
+                'description': 'Рекомендательная система для музейных объектов',
+                'author': 'Рекомендательная система',
+                'version': '1.0'
+            },
+            output_dir='model_cards'
+        )
+
+        # 8. Итоговый отчет
+        print("\n" + "="*70)
+        print("🎉 ОЦЕНКА И СОХРАНЕНИЕ ЗАВЕРШЕНЫ!")
+        print("="*70)
+
+        print(f"\n📁 СОХРАНЕННЫЕ ФАЙЛЫ:")
+        print(f"   📊 Модель: {saved_model_path}")
+        print(f"   📈 Метрики: {saved_results['metrics_file'] if saved_results else 'Не сохранены'}")
+        print(f"   📋 Отчет: {saved_results['report_file'] if saved_results else 'Не сохранен'}")
+        print(f"   📄 Карточка модели: {model_card_path}")
+
+        # Вывод ключевых метрик
+        print(f"\n🏆 КЛЮЧЕВЫЕ МЕТРИКИ:")
+        metrics = results['metrics']
+        print(f"   Accuracy@10:   {metrics.get('accuracy@10', 0):.4f}")
+        print(f"   Precision@10:  {metrics.get('precision@10', 0):.4f}")
+        print(f"   Recall@10:     {metrics.get('recall@10', 0):.4f}")
+        print(f"   F1-Score@10:   {metrics.get('f1@10', 0):.4f}")
+        print(f"   nDCG@10:       {metrics.get('ndcg@10', 0):.4f}")
+        print(f"   MAP@10:        {metrics.get('map@10', 0):.4f}")
+
+        print(f"\n📊 ПОКРЫТИЕ:")
+        coverage = results['coverage_stats']
+        print(f"   Объектов в train: {coverage['unique_items_in_train']}")
+        print(f"   Объектов рекомендовано: {coverage['unique_items_recommended']}")
+        print(f"   Покрытие: {coverage['item_coverage']:.2%}")
+
+    except Exception as e:
+        print(f"\n💥 КРИТИЧЕСКАЯ ОШИБКА: {e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
