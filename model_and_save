@@ -1,0 +1,460 @@
+# model_ranking.py
+import pandas as pd
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+from sentence_transformers import CrossEncoder
+import pickle
+import warnings
+warnings.filterwarnings('ignore')
+
+class RankingModel:
+    def __init__(self):
+        self.items_df = None
+        self.train_df = None
+        self.test_df = None
+        self.text_embeddings = None
+        self.title_embeddings = None
+        self.svd_embeddings = None
+        self.tfidf_matrix_full = None
+        self.tfidf_matrix_title = None
+        self.cross_encoder = None
+        self.reranker = None
+        self.vectorizer_full = None
+        self.vectorizer_title = None
+        self.available_items = None
+        self.relevance_pairs = None
+        self.item_popularity = None
+        self.query_expansion_dict = None
+        self.item_similarity_matrix = None
+
+    def load_preprocessed_data(self):
+        """Загрузка предобработанных данных"""
+        print("📂 ЗАГРУЗКА ПРЕДОБРАБОТАННЫХ ДАННЫХ...")
+
+        with open('preprocessed_data.pkl', 'rb') as f:
+            data = pickle.load(f)
+
+        self.items_df = data['items_df']
+        self.text_embeddings = data['text_embeddings']
+        self.text_embeddings_title = data['text_embeddings_title']
+        self.svd_embeddings = data['svd_embeddings']
+        self.tfidf_matrix_full = data['tfidf_matrix_full']
+        self.tfidf_matrix_title = data['tfidf_matrix_title']
+        self.relevance_pairs = data['relevance_pairs']
+        self.item_popularity = data['item_popularity']
+        self.query_expansion_dict = data['query_expansion_dict']
+        self.available_items = data['available_items']
+        self.train_df = data['train_df']
+        self.test_df = data['test_df']
+        self.vectorizer_full = data['vectorizer_full']
+        self.vectorizer_title = data['vectorizer_title']
+
+        print(f"📊 Загружено {len(self.items_df)} объектов")
+        print(f"🧪 Загружено {len(self.test_df)} тестовых объектов")
+
+    def initialize_advanced_rerankers(self):
+        """Инициализация продвинутых переранжировщиков"""
+        print("🎯 ИНИЦИАЛИЗАЦИЯ ПЕРЕРАНЖИРОВЩИКОВ...")
+
+        try:
+            # Основной кросс-энкодер
+            self.cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+            print("✅ Основной кросс-энкодер загружен")
+
+            # Дополнительный переранжировщик
+            try:
+                self.reranker = CrossEncoder('cross-encoder/stsb-roberta-base')
+                print("✅ Дополнительный переранжировщик загружен")
+            except:
+                print("⚠️  Дополнительный переранжировщик не загружен, используем основной")
+                self.reranker = self.cross_encoder
+
+        except Exception as e:
+            print(f"❌ Ошибка загрузки переранжировщиков: {e}")
+            print("⚠️  Продолжаем без переранжировщиков")
+            self.cross_encoder = None
+            self.reranker = None
+
+    def build_mega_similarity_matrix(self):
+        """Построение мега-матрицы схожести"""
+        print("🏗️ ПОСТРОЕНИЕ МЕГА-МАТРИЦЫ СХОЖЕСТИ...")
+
+        # Множественные матрицы схожести
+        embedding_similarity = cosine_similarity(self.text_embeddings)
+        title_similarity = cosine_similarity(self.text_embeddings_title)
+        svd_similarity = cosine_similarity(self.svd_embeddings)
+
+        # Адаптивное комбинирование
+        self.item_similarity_matrix = (
+            0.50 * embedding_similarity +
+            0.30 * title_similarity +
+            0.20 * svd_similarity
+        )
+
+        print(f"✅ Размерность мега-матрицы: {self.item_similarity_matrix.shape}")
+
+    def query_expansion(self, query_item_id):
+        """Расширение запроса на основе train данных"""
+        expanded_queries = []
+
+        if query_item_id in self.relevance_pairs:
+            # Прямые релевантные объекты
+            for relevant_item in self.relevance_pairs[query_item_id]:
+                if relevant_item in self.query_expansion_dict:
+                    expanded_queries.extend(self.query_expansion_dict[relevant_item])
+
+        # Уникальные расширенные запросы
+        expanded_queries = list(set(expanded_queries))
+        return expanded_queries[:5]  # Ограничим количество
+
+    def get_candidate_pool(self, query_item_id, num_candidates=200):
+        """Создание пула кандидатов максимального качества"""
+        try:
+            if query_item_id not in self.available_items:
+                return []
+
+            query_idx = self.items_df[self.items_df['item_id'] == query_item_id].index[0]
+            query_modality = self.items_df.loc[query_idx, 'modality']
+
+            # Основные кандидаты по семантическому сходству
+            similarities = self.item_similarity_matrix[query_idx]
+
+            candidate_scores = []
+            for idx, score in enumerate(similarities):
+                if idx == query_idx:
+                    continue
+
+                candidate_id = self.items_df.iloc[idx]['item_id']
+                candidate_modality = self.items_df.iloc[idx]['modality']
+
+                if candidate_modality != query_modality and score > 0.05:
+                    popularity = self.item_popularity.get(candidate_id, 0)
+                    # Комбинированный скор
+                    combined_score = score + (np.log1p(popularity) * 0.1)
+                    candidate_scores.append((candidate_id, combined_score, candidate_modality))
+
+            # Сортируем и отбираем
+            candidate_scores.sort(key=lambda x: x[1], reverse=True)
+
+            # Кандидаты из расширения запроса
+            expansion_candidates = []
+            expanded_queries = self.query_expansion(query_item_id)
+
+            for exp_query in expanded_queries:
+                if exp_query in self.available_items:
+                    exp_idx = self.items_df[self.items_df['item_id'] == exp_query].index[0]
+                    exp_similarities = self.item_similarity_matrix[exp_idx]
+
+                    for idx, score in enumerate(exp_similarities):
+                        if idx == exp_idx:
+                            continue
+
+                        candidate_id = self.items_df.iloc[idx]['item_id']
+                        candidate_modality = self.items_df.iloc[idx]['modality']
+
+                        if (candidate_modality != query_modality and
+                            candidate_id != query_item_id and
+                            score > 0.1):
+
+                            # Проверяем, нет ли уже этого кандидата
+                            existing = any(c[0] == candidate_id for c in candidate_scores[:num_candidates//2])
+                            if not existing:
+                                expansion_candidates.append((candidate_id, score * 0.8, candidate_modality))
+
+            # Объединяем кандидатов
+            all_candidates = candidate_scores[:num_candidates//2] + expansion_candidates
+
+            # Уникальные кандидаты
+            unique_candidates = {}
+            for candidate_id, score, modality in all_candidates:
+                if candidate_id not in unique_candidates:
+                    unique_candidates[candidate_id] = (score, modality)
+                else:
+                    # Берем максимальный скор
+                    unique_candidates[candidate_id] = (max(unique_candidates[candidate_id][0], score), modality)
+
+            return [(candidate_id, score, modality)
+                   for candidate_id, (score, modality) in unique_candidates.items()]
+
+        except Exception as e:
+            print(f"❌ Ошибка создания пула кандидатов: {e}")
+            return []
+
+    def advanced_reranking(self, query_item_id, candidates, top_k=10):
+        """Продвинутое переранжирование кандидатов"""
+        try:
+            if not candidates or not self.cross_encoder:
+                # Возвращаем только ID кандидатов
+                return [(c[0], c[1], c[2]) for c in candidates[:top_k]]
+
+            query_idx = self.items_df[self.items_df['item_id'] == query_item_id].index[0]
+            query_text = self.items_df.loc[query_idx, 'combined_full']
+
+            # Подготавливаем тексты кандидатов
+            candidate_texts = []
+            candidate_data = []
+
+            for candidate_id, score, modality in candidates[:50]:  # Переранжируем топ-50
+                candidate_idx = self.items_df[self.items_df['item_id'] == candidate_id].index[0]
+                candidate_text = self.items_df.loc[candidate_idx, 'combined_full']
+                candidate_texts.append(candidate_text)
+                candidate_data.append((candidate_id, score, modality))
+
+            # Получаем скоры от кросс-энкодера
+            pairs = [(query_text, cand_text) for cand_text in candidate_texts]
+            cross_scores = self.cross_encoder.predict(pairs)
+
+            # Комбинируем скоры
+            reranked_candidates = []
+            for i, (candidate_id, semantic_score, modality) in enumerate(candidate_data):
+                cross_score = cross_scores[i]
+
+                # Адаптивное взвешивание
+                if semantic_score > 0.3:  # Высокое семантическое сходство
+                    final_score = 0.4 * semantic_score + 0.6 * cross_score
+                else:  # Среднее/низкое семантическое сходство
+                    final_score = 0.2 * semantic_score + 0.8 * cross_score
+
+                # Бонус за популярность
+                popularity_bonus = np.log1p(self.item_popularity.get(candidate_id, 0)) * 0.05
+                final_score += popularity_bonus
+
+                reranked_candidates.append((candidate_id, final_score, modality))
+
+            # Сортируем по финальному скору
+            reranked_candidates.sort(key=lambda x: x[1], reverse=True)
+
+            # ВАЖНО: Всегда возвращаем кортежи из 3 элементов
+            return reranked_candidates[:top_k]
+
+        except Exception as e:
+            print(f"❌ Ошибка переранжирования: {e}")
+            # Возвращаем оригинальных кандидатов в правильном формате
+            return [(c[0], c[1], c[2]) for c in candidates[:top_k]]
+
+    def diversity_optimization(self, candidates, top_k=10):
+        """Оптимизация разнообразия рекомендаций"""
+        if not candidates:
+            return []
+
+        final_recommendations = []
+        modality_counts = {}
+        used_items = set()
+
+        # Проходим по кандидатам в порядке убывания релевантности
+        for candidate_id, score, modality in candidates:
+            if len(final_recommendations) >= top_k:
+                break
+
+            if candidate_id in used_items:
+                continue
+
+            # Контроль разнообразия модальностей
+            current_count = modality_counts.get(modality, 0)
+            max_per_modality = max(3, top_k // 3)  # Адаптивный лимит
+
+            if current_count < max_per_modality:
+                final_recommendations.append(candidate_id)
+                used_items.add(candidate_id)
+                modality_counts[modality] = current_count + 1
+
+        # Если не набрали достаточно, добавляем лучших из оставшихся
+        if len(final_recommendations) < top_k:
+            for candidate_id, score, modality in candidates:
+                if len(final_recommendations) >= top_k:
+                    break
+                if candidate_id not in used_items:
+                    final_recommendations.append(candidate_id)
+                    used_items.add(candidate_id)
+
+        return final_recommendations[:top_k]
+
+    def get_maximum_ndcg_recommendations(self, query_item_id, top_k=10):
+        """МАКСИМАЛЬНО ВОЗМОЖНОЕ УЛУЧШЕНИЕ nDCG"""
+        try:
+            if query_item_id not in self.available_items:
+                fallback = self.get_ultimate_fallback(top_k)
+                # Преобразуем в правильный формат
+                return [item[0] if isinstance(item, tuple) else item for item in fallback]
+
+            # Этап 1: Создание пула кандидатов
+            candidates = self.get_candidate_pool(query_item_id, num_candidates=200)
+
+            if not candidates:
+                fallback = self.get_ultimate_fallback(top_k)
+                return [item[0] if isinstance(item, tuple) else item for item in fallback]
+
+            # Этап 2: Переранжирование
+            reranked_candidates = self.advanced_reranking(query_item_id, candidates, top_k)
+
+            # Этап 3: Оптимизация разнообразия
+            final_recommendations = self.diversity_optimization(reranked_candidates, top_k)
+
+            # Этап 4: Гарантия качества
+            if len(final_recommendations) < min(7, top_k):
+                # Добавляем подтвержденные релевантные объекты
+                if query_item_id in self.relevance_pairs:
+                    train_items = [item for item in self.relevance_pairs[query_item_id]
+                                 if item not in final_recommendations and item in self.available_items]
+                    final_recommendations.extend(train_items[:top_k - len(final_recommendations)])
+
+            return final_recommendations[:top_k]
+
+        except Exception as e:
+            print(f"❌ Критическая ошибка для {query_item_id}: {e}")
+            fallback = self.get_ultimate_fallback(top_k)
+            # Преобразуем в правильный формат
+            return [item[0] if isinstance(item, tuple) else item for item in fallback]
+
+    def get_ultimate_fallback(self, top_k=10):
+        """Ультимативный запасной вариант"""
+        try:
+            # Комбинируем популярность и разнообразие
+            modality_items = {}
+
+            for item_id in self.available_items:
+                modality = self.items_df[self.items_df['item_id'] == item_id]['modality'].iloc[0]
+                popularity = self.item_popularity.get(item_id, 0)
+
+                if modality not in modality_items:
+                    modality_items[modality] = []
+                modality_items[modality].append((item_id, popularity))
+
+            # Сортируем по популярности
+            for modality in modality_items:
+                modality_items[modality].sort(key=lambda x: x[1], reverse=True)
+
+            # Собираем сбалансированный список
+            recommendations = []
+            max_per_modality = max(2, top_k // len(modality_items))
+
+            while len(recommendations) < top_k:
+                for modality in list(modality_items.keys()):
+                    if len(recommendations) >= top_k:
+                        break
+                    if modality_items[modality]:
+                        item_id, popularity = modality_items[modality][0]
+                        recommendations.append(item_id)  # Возвращаем только ID
+                        modality_items[modality].pop(0)
+                    else:
+                        # Удаляем пустые модальности
+                        del modality_items[modality]
+
+                if not modality_items:
+                    break
+
+            return recommendations[:top_k]
+
+        except:
+            # Абсолютный fallback
+            all_items = list(self.available_items)
+            return all_items[:top_k]
+
+    def generate_maximum_recommendations(self):
+        """Генерация рекомендаций максимального качества"""
+        print("🎯 ГЕНЕРАЦИЯ РЕКОМЕНДАЦИЙ МАКСИМАЛЬНОГО КАЧЕСТВА...")
+
+        recommendations = []
+
+        for i, query_item_id in enumerate(self.test_df['id']):
+            if i % 10 == 0:
+                print(f"✅ Обработано {i}/{len(self.test_df)} запросов")
+
+            max_ndcg_items = self.get_maximum_ndcg_recommendations(query_item_id, top_k=10)
+            recommendations.append(' '.join(max_ndcg_items))
+
+        return recommendations
+
+    def create_final_submission(self, recommendations):
+        """Создание финального submission файла"""
+        print("💾 СОЗДАНИЕ ФИНАЛЬНОГО SUBMISSION...")
+
+        submission_df = self.test_df.copy()
+        submission_df['relevant_item_id_list'] = recommendations
+        submission_df.to_csv('submission.csv', index=False)
+
+        # Детальная аналитика
+        rec_lengths = [len(rec.split()) for rec in recommendations]
+
+        print("\n" + "="*50)
+        print("🎉 ФИНАЛЬНАЯ СТАТИСТИКА")
+        print("="*50)
+        print(f"📊 Всего запросов: {len(recommendations)}")
+        print(f"📈 Среднее количество рекомендаций: {np.mean(rec_lengths):.2f}")
+        print(f"📉 Минимальное количество: {min(rec_lengths)}")
+        print(f"📈 Максимальное количество: {max(rec_lengths)}")
+
+        # Детальное распределение
+        length_counts = pd.Series(rec_lengths).value_counts().sort_index()
+        print("\n📋 Распределение рекомендаций:")
+        for length, count in length_counts.items():
+            percentage = count/len(recommendations)*100
+            print(f"   {length} рекомендаций: {count} запросов ({percentage:.1f}%)")
+
+        # Ключевые метрики
+        ten_recommendations = rec_lengths.count(10)
+        print(f"\n🎯 Запросов с 10 рекомендациями: {ten_recommendations} ({ten_recommendations/len(recommendations)*100:.1f}%)")
+
+        high_quality = sum(1 for length in rec_lengths if length >= 8)
+        print(f"🏆 Высококачественных запросов (8+): {high_quality} ({high_quality/len(recommendations)*100:.1f}%)")
+
+def main():
+    """Основная функция ранжирования"""
+    try:
+        print("🚀 ЗАПУСК МОДЕЛИ РАНЖИРОВАНИЯ")
+        print("="*60)
+
+        # Инициализация модели ранжирования
+        ranking_model = RankingModel()
+
+        # Загрузка предобработанных данных
+        ranking_model.load_preprocessed_data()
+
+        # Инициализация переранжировщиков
+        ranking_model.initialize_advanced_rerankers()
+
+        # Построение мега-матрицы схожести
+        ranking_model.build_mega_similarity_matrix()
+
+        # Генерация рекомендаций максимального качества
+        print("\n🎯 НАЧАЛО ГЕНЕРАЦИИ РЕКОМЕНДАЦИЙ...")
+        recommendations = ranking_model.generate_maximum_recommendations()
+
+        # Создание финального submission
+        ranking_model.create_final_submission(recommendations)
+
+        # Демонстрация лучших примеров
+        print("\n⭐ ЛУЧШИЕ ПРИМЕРЫ РЕКОМЕНДАЦИЙ:")
+        print("="*50)
+
+        displayed = 0
+        for i in range(min(5, len(ranking_model.test_df))):
+            query_id = ranking_model.test_df.iloc[i]['id']
+            if query_id in ranking_model.available_items:
+                query_item = ranking_model.items_df[ranking_model.items_df['item_id'] == query_id].iloc[0]
+                recommended = recommendations[i].split()
+
+                print(f"\n🔍 Запрос: {query_item['title']}")
+                print(f"   Модальность: {query_item['modality']}")
+                print(f"   Найдено рекомендаций: {len(recommended)}")
+                print("   Топ рекомендаций:")
+
+                for j, rec_id in enumerate(recommended[:8]):
+                    if rec_id in ranking_model.available_items:
+                        rec_item = ranking_model.items_df[ranking_model.items_df['item_id'] == rec_id].iloc[0]
+                        print(f"   {j+1}. {rec_item['title'][:45]}... ({rec_item['modality']})")
+
+                displayed += 1
+                if displayed >= 3:
+                    break
+
+        print("\n🎉 РАНЖИРОВАНИЕ УСПЕШНО ЗАВЕРШЕНО!")
+        print("💾 Результаты сохранены в submission.csv")
+
+    except Exception as e:
+        print(f"💥 КРИТИЧЕСКАЯ ОШИБКА: {e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
